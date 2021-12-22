@@ -1,0 +1,67 @@
+// Authors:
+//
+// Hugh Greene <githugh@tameter.org>
+// Jenn Archibald <jennarchibald91@gmail.com>
+
+import java.nio.file.FileSystem
+import java.nio.file.FileSystems
+import java.nio.file.Files
+
+// Remove any JndiManager and JndiLookup class files found in log4j-core jars
+// during dependency resolution, as a mitigation for CVE-2021-44228.  See
+// <https://logging.apache.org/log4j/2.x/security.html#CVE-2021-44228>.
+//
+// This allows you to build older versions of existing projects without updating
+// and avoid the log4shell vulnerability.  You may wish to add other files to
+// the log4ShellFilesToDelete list based on various pieces of advice on the
+// Internet, e.g., <https://snyk.io/blog/log4shell-remediation-cheat-sheet/>.
+//
+// Requires JDK 1.7 and Gradle 3.4.
+
+gradle.addListener(new DependencyResolutionListener() {
+    public static final List<String> log4ShellFilesToDelete = [
+            'org/apache/logging/log4j/core/lookup/JndiLookup.class',
+            'org/apache/logging/log4j/core/net/JndiManager.class',
+    ]
+
+    @Override
+    void beforeResolve(final ResolvableDependencies dependencies) { }
+
+    @Override
+    void afterResolve(final ResolvableDependencies dependencies) {
+        // We use a lenient ArtifactView in case we are being asked to resolve a lenient Configuration.
+        Collection<ArtifactResult> log4JCoreArtifacts =
+                dependencies.artifactView { lenient = true }.artifacts.findAll {
+                    ComponentIdentifier id = it.id.componentIdentifier
+                    (id instanceof ModuleComponentIdentifier) &&
+                        id.group == 'org.apache.logging.log4j' && id.module == 'log4j-core'
+                }
+        log4JCoreArtifacts
+                .findAll { ArtifactResult it ->
+                     it instanceof ResolvedArtifactResult && it.file.name.endsWith('.jar')
+                }
+                .forEach { ResolvedArtifactResult it ->
+                    getZipFileSystem(it.file).withCloseable { FileSystem zipFileSystem ->
+                        deleteLog4ShellFiles(dependencies.path, it.file, zipFileSystem)
+                    }
+                }
+    }
+
+    FileSystem getZipFileSystem(File file) {
+        return FileSystems.newFileSystem(URI.create("jar:${file.toURI()}"), ['create': 'false'])
+    }
+
+    void deleteLog4ShellFiles(String resolvableDependenciesPath, File file, FileSystem zipFileSystem) {
+        log4ShellFilesToDelete.forEach { String fileToDelete ->
+            if (Files.deleteIfExists(zipFileSystem.getPath(fileToDelete))) {
+                logger.warn("While resolving ${resolvableDependenciesPath}, " +
+                        "in order to avoid log4shell vulnerabilities, deleted ${fileToDelete} from '${file}'. " +
+                        "Consider upgrading your project to use a version of log4j without the vulnerability.")
+            } else {
+                logger.debug("While resolving ${resolvableDependenciesPath}, " +
+                        "and deleting files to avoid log4shell vulnerabilities, " +
+                        "did not find ${fileToDelete} in '${file}'.")
+            }
+        }
+    }
+})
