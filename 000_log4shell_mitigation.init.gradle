@@ -8,21 +8,28 @@ import java.nio.file.FileSystems
 import java.nio.file.Files
 
 // Remove any JndiManager and JndiLookup class files found in log4j-core jars
-// during dependency resolution, as a mitigation for CVE-2021-44228.  See
-// <https://logging.apache.org/log4j/2.x/security.html#CVE-2021-44228>.
+// for 2.x versions before 2.16.0 during dependency resolution, as a mitigation for
+// CVE-2021-44228 and CVE-2021-45102.
+// See <https://logging.apache.org/log4j/2.x/security.html>.
 //
 // This allows you to build older versions of existing projects without updating
 // and avoid the log4shell vulnerability.  You may wish to add other files to
 // the log4ShellFilesToDelete list based on various pieces of advice on the
 // Internet, e.g., <https://snyk.io/blog/log4shell-remediation-cheat-sheet/>.
 //
+// WARNING: To make sure this takes effect, you should remove all existing versions
+// of org.apache.logging.log4j/log4j-core from your Gradle cache (typically under
+// $GRADLE_USER_HOME/caches/modules-2/files-2.1/).
+//
 // Requires JDK 1.7 and Gradle 3.4.
 
 gradle.addListener(new DependencyResolutionListener() {
-    public static final List<String> log4ShellFilesToDelete = [
+    public static final List<String> LOG4SHELL_FILES_TO_DELETE = [
             'org/apache/logging/log4j/core/lookup/JndiLookup.class',
             'org/apache/logging/log4j/core/net/JndiManager.class',
     ]
+
+    private final Object deleteLock = new Object()
 
     @Override
     void beforeResolve(final ResolvableDependencies dependencies) { }
@@ -33,18 +40,54 @@ gradle.addListener(new DependencyResolutionListener() {
         Collection<ArtifactResult> log4JCoreArtifacts =
                 dependencies.artifactView { lenient = true }.artifacts.findAll {
                     ComponentIdentifier id = it.id.componentIdentifier
-                    (id instanceof ModuleComponentIdentifier) &&
-                        id.group == 'org.apache.logging.log4j' && id.module == 'log4j-core'
+                    (id instanceof ModuleComponentIdentifier) && isApplicableVersion(id)
                 }
         log4JCoreArtifacts
                 .findAll { ArtifactResult it ->
                      it instanceof ResolvedArtifactResult && it.file.name.endsWith('.jar')
                 }
-                .forEach { ResolvedArtifactResult it ->
-                    getZipFileSystem(it.file).withCloseable { FileSystem zipFileSystem ->
-                        deleteLog4ShellFiles(dependencies.path, it.file, zipFileSystem)
-                    }
-                }
+                .forEach { ResolvedArtifactResult it -> deleteLog4ShellFiles(dependencies.path, it.file) }
+    }
+
+    /**
+     * Versions of log4j-core 2.x before 2.16 benefit from having two JNDI-related classes removed; from 2.16 onwards
+     * those classes are fixed and, moreover, removing them may cause log4j projects to fail to run, with a {@link
+     * java.lang.NoClassDefFoundError}.
+     */
+    boolean isApplicableVersion(ModuleComponentIdentifier id) {
+        final isLog4JCore = id.group == 'org.apache.logging.log4j' && id.module == 'log4j-core'
+        if (!isLog4JCore) {
+            // Return early to skip version number parsing for efficiency.
+            return false
+        }
+
+        // We don't need general-purpose version parsing as per the complex Gradle algorithm (see
+        // https://docs.gradle.org/current/userguide/single_versions.html); we only need to parse log4j versions in the
+        // 2.x line, to check if they're earlier than 2.16.  These are of the form "2.Y.Z", "2.Y", or "2.0-P" for
+        // numbers Y & Z, where P is something like "rc1" or "beta9", which we ignore.
+        final String[] parts = id.version.split("[.-]")
+        if (parts[0] != '2') {
+            return false
+        }
+        if (parts.length == 1) {
+            logger.warn("Ignoring log4j-core with unexpected version number format: '${id.version}'")
+            return false
+        }
+        try {
+            return (Integer.parseInt(parts[1]) < 16)
+        } catch (NumberFormatException ignored) {
+            logger.warn("Ignoring log4j-core with unexpected version number format: '${id.version}'")
+            return false
+        }
+    }
+
+    void deleteLog4ShellFiles(String resolvableDependenciesPath, File file) {
+        // Multiple configurations with the same dependencies could be resolved in parallel, so lock JAR file access.
+        synchronized (deleteLock) {
+            getZipFileSystem(file).withCloseable { FileSystem zipFileSystem ->
+                deleteLog4ShellFiles(resolvableDependenciesPath, file, zipFileSystem)
+            }
+        }
     }
 
     FileSystem getZipFileSystem(File file) {
@@ -52,7 +95,7 @@ gradle.addListener(new DependencyResolutionListener() {
     }
 
     void deleteLog4ShellFiles(String resolvableDependenciesPath, File file, FileSystem zipFileSystem) {
-        log4ShellFilesToDelete.forEach { String fileToDelete ->
+        LOG4SHELL_FILES_TO_DELETE.forEach { String fileToDelete ->
             if (Files.deleteIfExists(zipFileSystem.getPath(fileToDelete))) {
                 logger.warn("While resolving ${resolvableDependenciesPath}, " +
                         "in order to avoid log4shell vulnerabilities, deleted ${fileToDelete} from '${file}'. " +
